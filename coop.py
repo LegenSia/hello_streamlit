@@ -3,8 +3,8 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 from contextlib import closing
 import psycopg2
-from streamlit_calendar import calendar as st_calendar  # pip install streamlit-calendar
-from st_circular_progress import CircularProgress       # pip install st-circular-progress
+from streamlit_calendar import calendar as st_calendar
+from st_circular_progress import CircularProgress
 
 
 # =========================================================
@@ -1511,63 +1511,64 @@ else:
                                         unsafe_allow_html=True,
                                     )
 
-                                # 서브태스크 체크 → 상태/진행률 자동 반영
-                                subtasks_orig = parse_subtasks(r.get("description") or "")
-                                subtasks_for_view = []
-                                changed = False
+                                        # 서브태스크 체크 → 상태/진행률 자동 반영
+                                    subtasks_orig = parse_subtasks(r.get("description") or "")
+                                    subtasks_for_view = []
+                                    changed = False
 
-                                # 화면에 보여줄 진행률/상태 (DB 값 or 로컬 계산 값)
-                                task_progress = r.get("progress") or 0
-                                task_status = r.get("status") or "Todo"
+                                    # 화면에 보여줄 진행률/상태 (DB 값 or 로컬 계산 값)
+                                    task_progress = r.get("progress") or 0
+                                    task_status = r.get("status") or "Todo"
 
-                                if subtasks_orig:
-                                    # 이미 Done이면 화면에서도 전부 체크된 상태로 보여주기
-                                    if task_status == "Done":
-                                        for (lbl, weight, done) in subtasks_orig:
-                                            subtasks_for_view.append((lbl, weight, True))
-                                    else:
-                                        subtasks_for_view = subtasks_orig[:]
+                                    if subtasks_orig:
+                                        # 이미 Done이면 화면에서도 전부 체크 처리
+                                        if task_status == "Done":
+                                            for (lbl, weight, done) in subtasks_orig:
+                                                    subtasks_for_view.append((lbl, weight, True))
+                                            else:
+                                                subtasks_for_view = subtasks_orig[:]
 
-                                    new_subtasks_after_click = []
-                                    for i, (lbl, weight, done_flag) in enumerate(subtasks_for_view):
-                                        key_cb = f"view_sub_done_{task_id}_{i}_{task_status}"
-                                        checked = st.checkbox(
-                                            f"{lbl} ({weight}%)",
-                                            value=done_flag,
-                                            key=key_cb,
+                                            new_subtasks_after_click = []
+                                            for i, (lbl, weight, done_flag) in enumerate(subtasks_for_view):
+                                                key_cb = f"view_sub_done_{task_id}_{i}_{task_status}"
+                                                checked = st.checkbox(
+                                                    f"{lbl} ({weight}%)",
+                                                    value=done_flag,
+                                                    key=key_cb,
+                                                )
+                                                if checked != done_flag:
+                                                    changed = True
+                                                new_subtasks_after_click.append((lbl, weight, checked))
+
+                                            if changed:
+                                                # 새 진행률/상태 계산
+                                                new_desc = serialize_subtasks(new_subtasks_after_click)
+                                                new_prog = calc_progress_from_subtasks(new_subtasks_after_click)
+
+                                                if new_prog == 0:
+                                                    new_status = "Todo"
+                                                elif new_prog == 100:
+                                                    new_status = "Done"
+                                                else:
+                                                    new_status = "In Progress"
+
+                                                # DB 즉시 업데이트
+                                                update_task(
+                                                    task_id,
+                                                    description=new_desc,
+                                                    progress=int(new_prog),
+                                                    status=new_status,
+                                                )
+
+                                                # 바로 화면 반영되도록 즉시 rerun
+                                                st.rerun()
+
+                                        # 진행률 표시
+                                        st.caption(
+                                            f"담당: {r['assignee'] or '-'} · "
+                                            f"마감: {r['due_date'] or '-'} · 진행률: {task_progress}%"
                                         )
-                                        if checked != done_flag:
-                                            changed = True
-                                        new_subtasks_after_click.append((lbl, weight, checked))
 
-                                    if changed:
-                                        # 새 진행률/상태 계산
-                                        new_desc = serialize_subtasks(new_subtasks_after_click)
-                                        new_prog = calc_progress_from_subtasks(new_subtasks_after_click)
-                                        if new_prog == 0:
-                                            new_status = "Todo"
-                                        elif new_prog == 100:
-                                            new_status = "Done"
-                                        else:
-                                            new_status = "In Progress"
-
-                                        # DB 업데이트
-                                        update_task(
-                                            task_id,
-                                            description=new_desc,
-                                            progress=int(new_prog),
-                                            status=new_status,
-                                        )
-
-                                        # 화면 표시용 값도 같이 업데이트 (이번 런에서 바로 보이게)
-                                        task_progress = int(new_prog)
-                                        task_status = new_status
-
-                                     # 진행률/상태 표시할 때는 r['progress'] / r['status'] 대신 이 변수 사용
-                                    st.caption(
-                                    f"담당: {r['assignee'] or '-'} · "
-                                    f"마감: {r['due_date'] or '-'} · 진행률: {task_progress}%"
-                                                    )
 
                                                                         
                                     b_done, b_edit, b_del = st.columns(
