@@ -1116,8 +1116,12 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
         if projects_df.empty:
             st.caption("등록된 프로젝트가 없습니다.")
         else:
+            # 실제 있는 컬럼만 사용
+            wanted_cols = ["id", "name", "description", "created_at"]
+            exist_cols = [c for c in wanted_cols if c in projects_df.columns]
+
             st.dataframe(
-                projects_df[["id", "name", "description", "created_at"]],
+                projects_df[exist_cols],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -1565,11 +1569,7 @@ else:
                                     f"마감: {r['due_date'] or '-'} · 진행률: {task_progress}%"
                                                     )
 
-                                    st.caption(
-                                        f"담당: {r['assignee'] or '-'} · "
-                                        f"마감: {r['due_date'] or '-'} · 진행률: {r['progress']}%"
-                                    )
-
+                                                                        
                                     b_done, b_edit, b_del = st.columns(
                                         3, gap="small"
                                     )
