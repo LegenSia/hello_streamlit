@@ -13,13 +13,13 @@ from st_circular_progress import CircularProgress       # pip install st-circula
 def get_conn():
     cfg = st.secrets["postgres"]
     return psycopg2.connect(
-        host=cfg["host"],
-        database=cfg["database"],
-        user=cfg["user"],
-        password=cfg["password"],
-        port=cfg.get("port", 5432),
+    host=cfg["host"],
+    database=cfg["database"],
+    user=cfg["user"],
+    password=cfg["password"],
+    port=cfg.get("port", 5432),
+    sslmode="require"
     )
-
 
 # =========================================================
 # 초기 스키마 / 샘플 데이터
