@@ -11,14 +11,21 @@ from st_circular_progress import CircularProgress       # pip install st-circula
 # DB 연결 (Supabase PostgreSQL)
 # =========================================================
 def get_conn():
+    # secrets에 postgres 설정이 없을 때 방어
+    if "postgres" not in st.secrets:
+        st.error(
+            "Postgres 설정이 없습니다. Streamlit Secrets에 [postgres] 정보를 추가하세요."
+        )
+        st.stop()
+
     cfg = st.secrets["postgres"]
     return psycopg2.connect(
-    host=cfg["host"],
-    database=cfg["database"],
-    user=cfg["user"],
-    password=cfg["password"],
-    port=cfg.get("port", 5432),
-    sslmode="require"
+        host=cfg["host"],
+        database=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+        port=cfg.get("port", 5432),
+        sslmode="require",  # Supabase는 SSL 필수
     )
 
 # =========================================================
