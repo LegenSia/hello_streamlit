@@ -1,234 +1,238 @@
 import streamlit as st
-import sqlite3
-from contextlib import closing
-from datetime import datetime, date, timedelta
 import pandas as pd
+from datetime import datetime, date, timedelta
+from contextlib import closing
+import psycopg2
 from streamlit_calendar import calendar as st_calendar  # pip install streamlit-calendar
 from st_circular_progress import CircularProgress       # pip install st-circular-progress
 
-DB = "collab.db"
 
-
-# ====================================
-# DB Helpers & 초기화
-# ====================================
+# =========================================================
+# DB 연결 (Supabase PostgreSQL)
+# =========================================================
 def get_conn():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+    cfg = st.secrets["postgres"]
+    return psycopg2.connect(
+        host=cfg["host"],
+        database=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+        port=cfg.get("port", 5432),
+    )
 
 
+# =========================================================
+# 초기 스키마 / 샘플 데이터
+# =========================================================
 def init_db():
-    with closing(get_conn()) as conn, conn:
-        conn.executescript(
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+
+        # projects
+        cur.execute(
             """
         CREATE TABLE IF NOT EXISTS projects(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             description TEXT,
             created_at TEXT NOT NULL
         );
+        """
+        )
 
+        # parts
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS parts(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
             color TEXT,
             created_at TEXT NOT NULL
         );
+        """
+        )
 
+        # users
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             email TEXT,
             part_id INTEGER,
             role TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(part_id) REFERENCES parts(id)
+            created_at TEXT NOT NULL
         );
+        """
+        )
 
+        # tasks
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS tasks(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             project_id INTEGER NOT NULL,
             part_id INTEGER NOT NULL,
             title TEXT NOT NULL,
             description TEXT,
             assignee TEXT,
-            priority TEXT CHECK(priority IN ('Low','Medium','High')) DEFAULT 'Medium',
-            status TEXT CHECK(status IN ('Todo','In Progress','Done')) DEFAULT 'Todo',
+            priority TEXT,
+            status TEXT,
             start_date TEXT,
             due_date TEXT,
-            progress INTEGER CHECK(progress BETWEEN 0 AND 100) DEFAULT 0,
+            progress INTEGER,
             tags TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(project_id) REFERENCES projects(id),
-            FOREIGN KEY(part_id) REFERENCES parts(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS user_parts(
-            user_id INTEGER NOT NULL,
-            part_id INTEGER NOT NULL,
-            PRIMARY KEY(user_id, part_id),
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(part_id) REFERENCES parts(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS user_projects(
-            user_id INTEGER NOT NULL,
-            project_id INTEGER NOT NULL,
-            PRIMARY KEY(user_id, project_id),
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(project_id) REFERENCES projects(id)
+            updated_at TEXT NOT NULL
         );
         """
         )
 
-        # parts에 color 컬럼 없으면 추가
-        cur = conn.execute("PRAGMA table_info(parts)")
-        cols = [r["name"] for r in cur.fetchall()]
-        if "color" not in cols:
-            conn.execute("ALTER TABLE parts ADD COLUMN color TEXT")
+        # user_parts
+        cur.execute(
+            """
+        CREATE TABLE IF NOT EXISTS user_parts(
+            user_id INTEGER NOT NULL,
+            part_id INTEGER NOT NULL,
+            PRIMARY KEY(user_id, part_id)
+        );
+        """
+        )
+
+        # user_projects
+        cur.execute(
+            """
+        CREATE TABLE IF NOT EXISTS user_projects(
+            user_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            PRIMARY KEY(user_id, project_id)
+        );
+        """
+        )
+
+        conn.commit()
 
 
 def seed_if_empty():
     now = datetime.utcnow().isoformat()
-    with closing(get_conn()) as conn, conn:
-        # '데모 프로젝트' 제거
-        conn.execute(
-            "DELETE FROM tasks WHERE project_id IN (SELECT id FROM projects WHERE name='데모 프로젝트')"
+
+    # '데모 프로젝트' 제거
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM tasks WHERE project_id IN (SELECT id FROM projects WHERE name=%s)",
+            ("데모 프로젝트",),
         )
-        conn.execute("DELETE FROM projects WHERE name='데모 프로젝트'")
+        cur.execute("DELETE FROM projects WHERE name=%s", ("데모 프로젝트",))
+        conn.commit()
 
-        # '빈 샘플 프로젝트' 보장
-        c = conn.execute(
-            "SELECT COUNT(*) AS c FROM projects WHERE name='빈 샘플 프로젝트'"
-        ).fetchone()["c"]
-        if c == 0:
-            conn.execute(
-                "INSERT INTO projects(name, description, created_at) VALUES(?,?,?)",
-                ("빈 샘플 프로젝트", "빈 프로젝트 (테스트용)", now),
-            )
+    # 프로젝트 기본 세팅
+    projects_df = list_projects()
+    if "빈 샘플 프로젝트" not in projects_df["name"].tolist():
+        insert_project("빈 샘플 프로젝트", "빈 프로젝트 (테스트용)")
 
-        # 파트 + 색상
-        default_colors = {
-            "기획": "#F97373",
-            "개발": "#6CB2EB",
-            "아트": "#FBC15E",
+    # 파트 기본 세팅
+    default_colors = {
+        "기획": "#F97373",
+        "개발": "#6CB2EB",
+        "아트": "#FBC15E",
+    }
+    parts_df = list_parts()
+    existing_names = parts_df["name"].tolist()
+
+    for name, color in default_colors.items():
+        if name not in existing_names:
+            insert_part(name, color)
+
+    parts_df = list_parts()
+    for _, row in parts_df.iterrows():
+        if not isinstance(row.get("color"), str) or not row["color"]:
+            color = default_colors.get(row["name"], "#3788d8")
+            update_part(int(row["id"]), color=color)
+
+    # 유저 기본 세팅
+    users_df = list_users()
+    if users_df.empty:
+        parts_df = list_parts()
+        parts_map = {
+            row["name"]: int(row["id"]) for _, row in parts_df.iterrows()
         }
-        existing = conn.execute("SELECT id, name, color FROM parts").fetchall()
-        existing_names = {r["name"] for r in existing}
+        sample_users = [
+            ("기획자 A", "planner@example.com", parts_map.get("기획"), "planner"),
+            ("개발자 B", "dev@example.com", parts_map.get("개발"), "developer"),
+            ("아티스트 C", "artist@example.com", parts_map.get("아트"), "artist"),
+        ]
+        for name, email, pid, role in sample_users:
+            if pid:
+                insert_user(name, email, [pid], role)
+            else:
+                insert_user(name, email, [], role)
 
-        for name, color in default_colors.items():
-            if name not in existing_names:
-                conn.execute(
-                    "INSERT INTO parts(name, color, created_at) VALUES(?,?,?)",
-                    (name, color, now),
-                )
-
-        rows = conn.execute("SELECT id, name, color FROM parts").fetchall()
-        for r in rows:
-            if r["color"] is None:
-                color = default_colors.get(r["name"], "#3788d8")
-                conn.execute(
-                    "UPDATE parts SET color=? WHERE id=?", (color, r["id"])
-                )
-
-        # 유저
-        c_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-        if c_users == 0:
-            parts_map = {
-                row["name"]: row["id"]
-                for row in conn.execute("SELECT id,name FROM parts").fetchall()
-            }
-            sample_users = [
-                ("기획자 A", "planner@example.com", parts_map.get("기획"), "planner"),
-                ("개발자 B", "dev@example.com", parts_map.get("개발"), "developer"),
-                ("아티스트 C", "artist@example.com", parts_map.get("아트"), "artist"),
-            ]
-            for u in sample_users:
-                conn.execute(
-                    "INSERT INTO users(name,email,part_id,role,created_at) VALUES(?,?,?,?,?)",
-                    (*u, now),
-                )
-
-        # users.part_id → user_parts
-        rows = conn.execute(
-            "SELECT id, part_id FROM users WHERE part_id IS NOT NULL"
-        ).fetchall()
-        for r in rows:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_parts(user_id, part_id) VALUES(?,?)",
-                (r["id"], r["part_id"]),
-            )
-
-        # user_projects: 기본 전체 프로젝트 권한
-        users = conn.execute("SELECT id FROM users").fetchall()
-        projects = conn.execute("SELECT id FROM projects").fetchall()
-        for u in users:
-            for p in projects:
-                conn.execute(
-                    "INSERT OR IGNORE INTO user_projects(user_id, project_id) VALUES(?,?)",
-                    (u["id"], p["id"]),
-                )
-
-        # 샘플 작업
-        c_tasks = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
-        if c_tasks == 0:
-            proj_row = conn.execute(
-                "SELECT id FROM projects ORDER BY id LIMIT 1"
-            ).fetchone()
-            if proj_row:
-                project_id = proj_row["id"]
-                parts_map = {
-                    row["name"]: row["id"]
-                    for row in conn.execute("SELECT id,name FROM parts").fetchall()
-                }
-                sample_tasks = [
-                    (
-                        project_id,
-                        parts_map["기획"],
-                        "기획 문서 정리",
-                        "요구사항 수집|40|0\n와이어프레임 정리|60|0",
-                        "기획자 A",
-                        "High",
-                        "Todo",
-                        (date.today() - timedelta(days=1)).isoformat(),
-                        (date.today() + timedelta(days=2)).isoformat(),
-                        0,
-                        "기획,문서",
-                    ),
-                ]
-                for t in sample_tasks:
-                    conn.execute(
-                        """
-                    INSERT INTO tasks(
-                        project_id, part_id, title, description, assignee, priority, status,
-                        start_date, due_date, progress, tags, created_at, updated_at
-                    )
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+    # 기존 유저들에게 프로젝트 권한 기본 부여
+    users_df = list_users()
+    projects_df = list_projects()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        for _, u in users_df.iterrows():
+            for _, p in projects_df.iterrows():
+                cur.execute(
+                    """
+                    INSERT INTO user_projects(user_id, project_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id, project_id) DO NOTHING
                     """,
-                        (*t, now, now),
-                    )
+                    (int(u["id"]), int(p["id"])),
+                )
+        conn.commit()
+
+    # 샘플 작업
+    tasks_df = list_tasks()
+    if tasks_df.empty and not projects_df.empty:
+        project_id = int(projects_df.iloc[0]["id"])
+        parts_df = list_parts()
+        parts_map = {
+            row["name"]: int(row["id"]) for _, row in parts_df.iterrows()
+        }
+        description = "요구사항 수집|40|0\n와이어프레임 정리|60|0"
+        insert_task(
+            project_id=project_id,
+            part_id=parts_map["기획"],
+            title="기획 문서 정리",
+            description=description,
+            assignee="기획자 A",
+            priority="High",
+            status="Todo",
+            start_date=(date.today() - timedelta(days=1)).isoformat(),
+            due_date=(date.today() + timedelta(days=2)).isoformat(),
+            progress=0,
+            tags="기획,문서",
+        )
 
 
-# ---------- Data access ----------
+# =========================================================
+# Data Access (Postgres + pandas)
+# =========================================================
 def list_projects():
     with closing(get_conn()) as conn:
         return pd.read_sql_query(
-            "SELECT * FROM projects ORDER BY created_at DESC, id DESC", conn
+            "SELECT * FROM projects ORDER BY created_at DESC, id DESC",
+            conn,
         )
 
 
 def list_parts():
     with closing(get_conn()) as conn:
-        return pd.read_sql_query("SELECT * FROM parts ORDER BY id", conn)
+        return pd.read_sql_query(
+            "SELECT * FROM parts ORDER BY id",
+            conn,
+        )
 
 
 def list_users():
     with closing(get_conn()) as conn:
         query = """
         SELECT u.*,
-               GROUP_CONCAT(p.name, ', ') AS part_names
+               COALESCE(string_agg(p.name, ', ' ORDER BY p.id), '') AS part_names
         FROM users u
         LEFT JOIN user_parts up ON up.user_id = u.id
         LEFT JOIN parts p ON p.id = up.part_id
@@ -248,10 +252,10 @@ def list_tasks(project_id=None, part_id=None):
         conds = []
         params = []
         if project_id is not None:
-            conds.append("t.project_id = ?")
+            conds.append("t.project_id = %s")
             params.append(project_id)
         if part_id is not None:
-            conds.append("t.part_id = ?")
+            conds.append("t.part_id = %s")
             params.append(part_id)
         if conds:
             base += " WHERE " + " AND ".join(conds)
@@ -261,70 +265,103 @@ def list_tasks(project_id=None, part_id=None):
 
 def insert_project(name, description):
     now = datetime.utcnow().isoformat()
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
-            "INSERT INTO projects(name, description, created_at) VALUES(?,?,?)",
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO projects(name, description, created_at) VALUES(%s,%s,%s)",
             (name, description, now),
         )
+        conn.commit()
 
 
 def update_project(project_id, **kwargs):
     sets = []
     params = []
     for k, v in kwargs.items():
-        sets.append(f"{k}=?")
+        sets.append(f"{k}=%s")
         params.append(v)
+    if not sets:
+        return
     params.append(project_id)
-    with closing(get_conn()) as conn, conn:
-        if sets:
-            conn.execute(
-                f"UPDATE projects SET {', '.join(sets)} WHERE id=?", params
-            )
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id=%s",
+            params,
+        )
+        conn.commit()
 
 
 def insert_part(name, color="#3788d8"):
     now = datetime.utcnow().isoformat()
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
-            "INSERT INTO parts(name, color, created_at) VALUES(?,?,?)",
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO parts(name, color, created_at) VALUES(%s,%s,%s)",
             (name, color, now),
         )
+        conn.commit()
 
 
 def update_part(part_id, **kwargs):
     sets = []
     params = []
     for k, v in kwargs.items():
-        sets.append(f"{k}=?")
+        sets.append(f"{k}=%s")
         params.append(v)
+    if not sets:
+        return
     params.append(part_id)
-    with closing(get_conn()) as conn, conn:
-        if sets:
-            conn.execute(
-                f"UPDATE parts SET {', '.join(sets)} WHERE id=?", params
-            )
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE parts SET {', '.join(sets)} WHERE id=%s",
+            params,
+        )
+        conn.commit()
 
 
 def insert_user(name, email, part_ids, role):
     now = datetime.utcnow().isoformat()
     main_part_id = part_ids[0] if part_ids else None
-    with closing(get_conn()) as conn, conn:
-        cur = conn.execute(
-            "INSERT INTO users(name,email,part_id,role,created_at) VALUES(?,?,?,?,?)",
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO users(name,email,part_id,role,created_at) VALUES(%s,%s,%s,%s,%s)",
             (name, email, main_part_id, role, now),
         )
-        user_id = cur.lastrowid
+        user_id = cur.fetchone()[0] if cur.description else None
+        if user_id is None:
+            # 다시 id 가져오기
+            cur.execute(
+                "SELECT id FROM users WHERE name=%s AND email=%s ORDER BY id DESC LIMIT 1",
+                (name, email),
+            )
+            user_id = cur.fetchone()[0]
+
         for pid in part_ids or []:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_parts(user_id, part_id) VALUES(?,?)",
+            cur.execute(
+                """
+                INSERT INTO user_parts(user_id, part_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, part_id) DO NOTHING
+                """,
                 (user_id, pid),
             )
-        prows = conn.execute("SELECT id FROM projects").fetchall()
+
+        cur.execute("SELECT id FROM projects")
+        prows = cur.fetchall()
         for p in prows:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_projects(user_id, project_id) VALUES(?,?)",
-                (user_id, p["id"]),
+            pid = p[0]
+            cur.execute(
+                """
+                INSERT INTO user_projects(user_id, project_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, project_id) DO NOTHING
+                """,
+                (user_id, pid),
             )
+        conn.commit()
         return user_id
 
 
@@ -332,31 +369,43 @@ def update_user(user_id, **kwargs):
     sets = []
     params = []
     for k, v in kwargs.items():
-        sets.append(f"{k}=?")
+        sets.append(f"{k}=%s")
         params.append(v)
+    if not sets:
+        return
     params.append(user_id)
-    with closing(get_conn()) as conn, conn:
-        if sets:
-            conn.execute(
-                f"UPDATE users SET {', '.join(sets)} WHERE id=?", params
-            )
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE users SET {', '.join(sets)} WHERE id=%s",
+            params,
+        )
+        conn.commit()
 
 
 def delete_user(user_id):
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM user_parts WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM user_projects WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM user_parts WHERE user_id=%s", (user_id,))
+        cur.execute("DELETE FROM user_projects WHERE user_id=%s", (user_id,))
+        cur.execute("DELETE FROM users WHERE id=%s", (user_id,))
+        conn.commit()
 
 
 def set_user_parts(user_id, part_ids):
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM user_parts WHERE user_id=?", (user_id,))
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM user_parts WHERE user_id=%s", (user_id,))
         for pid in part_ids or []:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_parts(user_id, part_id) VALUES(?,?)",
+            cur.execute(
+                """
+                INSERT INTO user_parts(user_id, part_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, part_id) DO NOTHING
+                """,
                 (user_id, pid),
             )
+        conn.commit()
 
 
 def get_parts_for_user(user_id):
@@ -366,27 +415,11 @@ def get_parts_for_user(user_id):
         SELECT p.*
         FROM user_parts up
         JOIN parts p ON p.id = up.part_id
-        WHERE up.user_id = ?
+        WHERE up.user_id = %s
         ORDER BY p.id
         """,
             conn,
-            params=(user_id,),
-        )
-
-
-def get_parts_for_user_name(user_name):
-    with closing(get_conn()) as conn:
-        return pd.read_sql_query(
-            """
-        SELECT p.*
-        FROM users u
-        JOIN user_parts up ON u.id = up.user_id
-        JOIN parts p ON p.id = up.part_id
-        WHERE u.name = ?
-        ORDER BY p.id
-        """,
-            conn,
-            params=(user_name,),
+            params=[user_id],
         )
 
 
@@ -397,11 +430,11 @@ def get_users_for_part(part_id):
         SELECT u.*
         FROM users u
         JOIN user_parts up ON up.user_id = u.id
-        WHERE up.part_id = ?
+        WHERE up.part_id = %s
         ORDER BY u.id
         """,
             conn,
-            params=(part_id,),
+            params=[part_id],
         )
 
 
@@ -412,22 +445,28 @@ def get_projects_for_user(user_id):
         SELECT pr.*
         FROM user_projects up
         JOIN projects pr ON pr.id = up.project_id
-        WHERE up.user_id = ?
+        WHERE up.user_id = %s
         ORDER BY pr.created_at DESC, pr.id DESC
         """,
             conn,
-            params=(user_id,),
+            params=[user_id],
         )
 
 
 def set_user_projects(user_id, project_ids):
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM user_projects WHERE user_id=?", (user_id,))
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM user_projects WHERE user_id=%s", (user_id,))
         for pid in project_ids or []:
-            conn.execute(
-                "INSERT OR IGNORE INTO user_projects(user_id, project_id) VALUES(?,?)",
+            cur.execute(
+                """
+                INSERT INTO user_projects(user_id, project_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, project_id) DO NOTHING
+                """,
                 (user_id, pid),
             )
+        conn.commit()
 
 
 def insert_task(
@@ -444,14 +483,15 @@ def insert_task(
     tags,
 ):
     now = datetime.utcnow().isoformat()
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO tasks(
                 project_id, part_id, title, description, assignee,
                 priority, status, start_date, due_date, progress, tags,
                 created_at, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 project_id,
@@ -469,6 +509,7 @@ def insert_task(
                 now,
             ),
         )
+        conn.commit()
 
 
 def update_task(task_id, **kwargs):
@@ -476,23 +517,30 @@ def update_task(task_id, **kwargs):
     sets = []
     params = []
     for k, v in kwargs.items():
-        sets.append(f"{k}=?")
+        sets.append(f"{k}=%s")
         params.append(v)
-    sets.append("updated_at=?")
+    sets.append("updated_at=%s")
     params.append(now)
     params.append(task_id)
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", params
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id=%s",
+            params,
         )
+        conn.commit()
 
 
 def delete_task(task_id):
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE id=%s", (task_id,))
+        conn.commit()
 
 
-# ---------- 색 변형 (같은 파트 안에서 살짝씩 다르게) ----------
+# =========================================================
+# Helper: 색상 변형 / 캘린더
+# =========================================================
 def adjust_color(hex_color: str, index: int) -> str:
     if not isinstance(hex_color, str) or not hex_color:
         hex_color = "#3788d8"
@@ -510,7 +558,6 @@ def adjust_color(hex_color: str, index: int) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
-# ---------- Calendar helper ----------
 def build_calendar_events(tasks_df, show_part_in_title=True):
     events = []
     if tasks_df is None or tasks_df.empty:
@@ -519,18 +566,26 @@ def build_calendar_events(tasks_df, show_part_in_title=True):
     color_idx_by_part = {}
 
     for _, r in tasks_df.iterrows():
-        s = None
-        e = None
-        if isinstance(r.get("start_date"), str) and r["start_date"]:
-            s = r["start_date"]
-        if isinstance(r.get("due_date"), str) and r["due_date"]:
-            e = r["due_date"]
+        s = r.get("start_date")
+        e = r.get("due_date")
+
         if not s and e:
             s = e
         if not e and s:
             e = s
         if not s and not e:
             s = e = date.today().isoformat()
+
+        if not isinstance(s, str):
+            try:
+                s = s.date().isoformat()
+            except Exception:
+                s = date.today().isoformat()
+        if not isinstance(e, str):
+            try:
+                e = e.date().isoformat()
+            except Exception:
+                e = s
 
         title = r["title"]
         if show_part_in_title and isinstance(r.get("part_name"), str):
@@ -582,8 +637,9 @@ def calendar_options_base():
     }
 
 
-# ---------- Description <-> subtasks ----------
-# 포맷: label|weight|done(0/1)
+# =========================================================
+# Subtask 파싱 / 진행률 계산
+# =========================================================
 def parse_subtasks(description: str):
     if not description:
         return []
@@ -665,13 +721,10 @@ def completion_ratio(tasks_df: pd.DataFrame) -> int:
     return int(round(100 * done_equiv / total))
 
 
-# ====================================
-# Streamlit UI & 로그인
-# ====================================
+# =========================================================
+# Streamlit 설정 및 로그인
+# =========================================================
 st.set_page_config(page_title="협업툴 - 일정/진행도", layout="wide")
-
-init_db()
-seed_if_empty()
 
 st.markdown(
     """
@@ -685,38 +738,58 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+init_db()
+seed_if_empty()
+
+auth_cfg = st.secrets.get("auth", {})
+COMPANY_NAME = auth_cfg.get("company_name", "Inha")
+ADMIN_USERNAME = auth_cfg.get("admin_username", "admin")
+ADMIN_PASSWORD = auth_cfg.get("admin_password", "1234")
+USER_USERNAME = auth_cfg.get("user_username", "user")
+USER_PASSWORD = auth_cfg.get("user_password", "1234")
+
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
     st.session_state["role"] = None
     st.session_state["current_tab"] = "대시보드"
 
-# ---- 로그인 화면 ----
+# 로그인
 if not st.session_state["logged_in"]:
     st.title("협업툴 로그인")
 
     with st.form("login_form"):
-        company = st.selectbox("회사", ["Inha"], index=0)
+        company = st.selectbox("회사", [COMPANY_NAME], index=0)
         username = st.text_input("아이디")
         password = st.text_input("비밀번호", type="password")
         login_btn = st.form_submit_button("로그인")
 
         if login_btn:
-            if (
-                company == "Inha"
-                and password == "1234"
-                and username in ["admin", "user"]
-            ):
+            ok = False
+            role = None
+
+            if company == COMPANY_NAME:
+                if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+                    ok = True
+                    role = "admin"
+                elif username == USER_USERNAME and password == USER_PASSWORD:
+                    ok = True
+                    role = "user"
+
+            if ok:
                 st.session_state["logged_in"] = True
-                st.session_state["role"] = username  # "admin" or "user"
+                st.session_state["role"] = role
                 st.session_state["current_tab"] = "대시보드"
                 st.rerun()
             else:
                 st.error("로그인 정보가 올바르지 않습니다.")
     st.stop()
 
-# 로그인 이후
-CURRENT_USER = "기획자 A"  # 데모용 고정
+CURRENT_USER = "기획자 A"  # 데모용
 
+
+# =========================================================
+# 공용 데이터
+# =========================================================
 projects_df = list_projects()
 parts_df = list_parts()
 part_names = parts_df["name"].tolist()
@@ -725,14 +798,15 @@ users_df = list_users()
 if "current_tab" not in st.session_state:
     st.session_state["current_tab"] = "대시보드"
 
-# user 계정이 관리자 탭에 들어가 있었으면 강제로 대시보드로
 if st.session_state["role"] == "user" and st.session_state["current_tab"] in [
     "프로젝트 관리",
     "유저 관리",
 ]:
     st.session_state["current_tab"] = "대시보드"
 
-# -------- 사이드바 --------
+# =========================================================
+# 사이드바
+# =========================================================
 with st.sidebar:
     st.markdown("### 프로젝트")
     if projects_df.empty:
@@ -757,7 +831,6 @@ with st.sidebar:
         if st.button(pname, use_container_width=True, key=f"tab_{pname}"):
             st.session_state["current_tab"] = f"파트:{pname}"
 
-    # 관리자 메뉴는 admin에게만
     if st.session_state["role"] == "admin":
         st.markdown("---")
         st.markdown("### 관리자")
@@ -766,7 +839,6 @@ with st.sidebar:
         if st.button("유저 관리", use_container_width=True):
             st.session_state["current_tab"] = "유저 관리"
 
-    # 맨 하단 로그아웃 버튼
     st.markdown("---")
     if st.button("로그아웃", use_container_width=True):
         st.session_state["logged_in"] = False
@@ -781,9 +853,10 @@ if selected_project_id:
 else:
     st.title("프로젝트가 없습니다")
 
-# ====================================
+
+# =========================================================
 # 대시보드
-# ====================================
+# =========================================================
 if current_tab == "대시보드":
     st.subheader("📊 대시보드 (전체 파트 일정)")
 
@@ -828,13 +901,18 @@ if current_tab == "대시보드":
 
         def is_on_day(row):
             due = row.get("due_date")
-            if not isinstance(due, str) or not due:
-                return False
+            if isinstance(due, str) and due:
+                try:
+                    d = date.fromisoformat(due)
+                    return d == selected_day
+                except Exception:
+                    return False
             try:
-                d = date.fromisoformat(due)
-                return d == selected_day
+                if pd.notna(due):
+                    return due.date() == selected_day
             except Exception:
                 return False
+            return False
 
         day_tasks = (
             filtered[filtered.apply(is_on_day, axis=1)]
@@ -878,11 +956,11 @@ if current_tab == "대시보드":
 
                     def parse_due(x):
                         try:
-                            return (
-                                date.fromisoformat(x)
-                                if isinstance(x, str) and x
-                                else None
-                            )
+                            if isinstance(x, str) and x:
+                                return date.fromisoformat(x)
+                            if pd.notna(x):
+                                return x.date()
+                            return None
                         except Exception:
                             return None
 
@@ -954,9 +1032,9 @@ if current_tab == "대시보드":
                             ).st_circular_progress()
                         idx += 1
 
-# ====================================
-# 프로젝트 관리 탭 (admin 전용)
-# ====================================
+# =========================================================
+# 프로젝트 관리 (admin)
+# =========================================================
 elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin":
     st.subheader("🧩 프로젝트 관리")
 
@@ -998,6 +1076,7 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
                     description=new_desc.strip(),
                 )
                 st.success("프로젝트가 수정되었습니다.")
+                st.rerun()
 
     with top_right:
         st.markdown("#### 파트 목록 / 수정")
@@ -1034,6 +1113,7 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
                             color=color_val,
                         )
                         st.success(f"{row['name']} 파트가 업데이트되었습니다.")
+                        st.rerun()
 
     st.markdown("---")
 
@@ -1051,6 +1131,7 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
                 else:
                     insert_project(p_name.strip(), p_desc.strip())
                     st.success("프로젝트가 추가되었습니다.")
+                    st.rerun()
 
     with bottom_right:
         st.markdown("#### 파트 추가")
@@ -1071,10 +1152,11 @@ elif current_tab == "프로젝트 관리" and st.session_state["role"] == "admin
                 else:
                     insert_part(new_part_name.strip(), new_part_color)
                     st.success("파트가 추가되었습니다.")
+                    st.rerun()
 
-# ====================================
-# 유저 관리 탭 (admin 전용)
-# ====================================
+# =========================================================
+# 유저 관리 (admin)
+# =========================================================
 elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
     st.subheader("👤 유저 관리")
 
@@ -1093,7 +1175,6 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
             )
 
     with col2:
-        # --- 유저 추가 (박스 없이 제목만) ---
         st.markdown("#### 유저 추가")
         with st.form("add_user"):
             u_name = st.text_input("이름*")
@@ -1119,18 +1200,15 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
                         u_role.strip() or None,
                     )
                     st.success("유저가 추가되었습니다.")
+                    st.rerun()
 
         st.write("")
         users_df = list_users()
         if users_df.empty:
             st.info("유저가 없습니다.")
         else:
-            # --- 유저 상세 설정 제목은 박스 밖으로 ---
             st.markdown("#### 유저 상세 설정")
-
-            # 전체 영역은 박스로 감싸기
             with st.container(border=True):
-                # 유저 선택
                 user_labels = [
                     f"{r['name']} ({r['email'] or '-'})"
                     for _, r in users_df.iterrows()
@@ -1148,10 +1226,9 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
                 projects_df = list_projects()
                 proj_names = projects_df["name"].tolist()
                 proj_id_by_name = {
-                    r["name"]: r["id"] for _, r in projects_df.iterrows()
+                    r["name"]: int(r["id"]) for _, r in projects_df.iterrows()
                 }
 
-                # 현재 파트 / 프로젝트
                 user_parts_df = get_parts_for_user(user_id)
                 current_part_names = (
                     user_parts_df["name"].tolist()
@@ -1170,7 +1247,6 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
                     if proj_id_by_name[name] in current_proj_ids
                 ]
 
-                # 파트 / 프로젝트 선택
                 new_parts = st.multiselect(
                     "파트",
                     part_names,
@@ -1182,7 +1258,6 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
                     default=current_proj_names,
                 )
 
-                # 버튼: [저장 및 수정] [유저 삭제]  (새 작업 추가의 버튼 배열처럼)
                 btn_col1, btn_col2 = st.columns(2, gap="small")
                 with btn_col1:
                     if st.button(
@@ -1190,7 +1265,6 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
                         key="save_user_parts",
                         use_container_width=True,
                     ):
-                        # 파트 저장
                         new_part_ids = []
                         for pn in new_parts:
                             pid = int(
@@ -1201,19 +1275,20 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
                         main_part_id = new_part_ids[0] if new_part_ids else None
                         update_user(user_id, part_id=main_part_id)
 
-                        # 프로젝트 저장
                         new_proj_ids = [proj_id_by_name[n] for n in new_proj_names]
                         set_user_projects(user_id, new_proj_ids)
                         st.success("설정이 저장·수정되었습니다.")
                         st.rerun()
 
                 with btn_col2:
-                    del_clicked = st.button("유저 삭제", key=f"del_user_{user_id}", use_container_width=True, type="secondary")
-                    
+                    del_clicked = st.button(
+                        "유저 삭제",
+                        key=f"del_user_{user_id}",
+                        use_container_width=True,
+                    )
                     if del_clicked:
                         st.session_state["confirm_del_user"] = user_id
 
-        # 삭제 확인 (박스 밖에 위치)
         if (
             "confirm_del_user" in st.session_state
             and not users_df.empty
@@ -1240,10 +1315,9 @@ elif current_tab == "유저 관리" and st.session_state["role"] == "admin":
                     ):
                         st.session_state.pop("confirm_del_user", None)
 
-
-# ====================================
+# =========================================================
 # 파트별 화면
-# ====================================
+# =========================================================
 else:
     if current_tab.startswith("파트:"):
         part_name = current_tab.split("파트:", 1)[1]
@@ -1325,7 +1399,6 @@ else:
                 user_options = ["(없음)"]
 
             col_todo, col_prog, col_done = st.columns(3)
-            status_order = ["Todo", "In Progress", "Done"]
 
             for label, col in [
                 ("Todo", col_todo),
@@ -1350,7 +1423,7 @@ else:
                                 )
 
                                 if not edit_mode:
-                                    # ----- 보기 모드 -----
+                                    # 보기 모드
                                     st.markdown(
                                         f"""
                                         <div style="display:flex;align-items:center;gap:8px;">
@@ -1364,6 +1437,7 @@ else:
                                         unsafe_allow_html=True,
                                     )
 
+                                    # 서브태스크 체크 → 상태/진행률 자동 반영
                                     subtasks_orig = parse_subtasks(
                                         r.get("description") or ""
                                     )
@@ -1419,8 +1493,6 @@ else:
                                                 status=new_status,
                                             )
                                             st.rerun()
-                                    else:
-                                        pass
 
                                     st.caption(
                                         f"담당: {r['assignee'] or '-'} · "
@@ -1508,7 +1580,7 @@ else:
                                                 )
 
                                 else:
-                                    # ----- 수정 모드 -----
+                                    # 수정 모드
                                     st.markdown("**수정 모드**")
                                     title_val = st.text_input(
                                         "제목",
@@ -1617,7 +1689,7 @@ else:
                                             st.session_state[edit_key] = False
                                             st.rerun()
 
-            # -------- 새 작업 추가 --------
+            # 새 작업 추가
             st.divider()
             st.markdown("### ➕ 새 작업 추가")
 
